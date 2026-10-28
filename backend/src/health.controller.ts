@@ -1,0 +1,1 @@
+import { Controller, Get } from '@nestjs/common'; @Controller('health') export class HealthController { @Get() getHealth(){return {status:'ok',service:'florist-pos-api',note:'API scaffold; business endpoints are not implemented yet'};} }

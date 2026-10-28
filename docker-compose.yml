@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nanghoa
+      POSTGRES_PASSWORD: nanghoa_local_dev_only
+      POSTGRES_DB: nanghoa
+    ports:
+      - "127.0.0.1:5435:5432"
+    volumes:
+      - nanghoa_pgdata_v51:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nanghoa -d nanghoa"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+volumes:
+  nanghoa_pgdata_v51:
+
+

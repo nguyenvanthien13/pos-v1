@@ -1,0 +1,292 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+enum RoleName {
+  OWNER
+  MANAGER
+  CASHIER
+  INVENTORY
+}
+enum OrderStatus {
+  NEW
+  CONFIRMED
+  PREPARING
+  READY
+  DELIVERING
+  DELIVERED
+  COMPLETED
+  CANCELLED
+}
+enum PaymentStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+  REFUNDED
+}
+enum PaymentMethod {
+  CASH
+  BANK_QR
+  CARD
+  OTHER
+}
+enum MovementType {
+  PURCHASE
+  SALE
+  WASTE
+  ADJUSTMENT
+  RECIPE_USE
+  RETURN
+}
+model Store {
+  id String @id @default(cuid())
+  name String
+  phone String?
+  address String?
+  createdAt DateTime @default(now())
+  users User[]
+  products Product[]
+  categories Category[]
+  customers Customer[]
+  suppliers Supplier[]
+  orders Order[]
+  paymentAccounts PaymentAccount[]
+  expenses Expense[]
+  @@index([name])
+}
+model User {
+  id String @id @default(cuid())
+  storeId String
+  store Store @relation(fields:[storeId], references:[id], onDelete:Cascade)
+  name String
+  email String
+  passwordHash String
+  role RoleName @default(CASHIER)
+  active Boolean @default(true)
+  createdAt DateTime @default(now())
+  auditLogs AuditLog[]
+  @@unique([storeId,email])
+  @@index([storeId,role])
+}
+model Category {
+  id String @id @default(cuid())
+  storeId String
+  store Store @relation(fields:[storeId],references:[id],onDelete:Cascade)
+  name String
+  active Boolean @default(true)
+  products Product[]
+  @@unique([storeId,name])
+}
+model Product {
+  id String @id @default(cuid())
+  storeId String
+  store Store @relation(fields:[storeId],references:[id],onDelete:Cascade)
+  categoryId String?
+  category Category? @relation(fields:[categoryId],references:[id],onDelete:SetNull)
+  sku String
+  name String
+  unit String
+  salePrice Decimal @db.Decimal(14,2)
+  costPrice Decimal @default(0) @db.Decimal(14,2)
+  stock Decimal @default(0) @db.Decimal(14,3)
+  lowStockThreshold Decimal @default(5) @db.Decimal(14,3)
+  imageUrl String?
+  isMaterial Boolean @default(false)
+  active Boolean @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  recipeItems RecipeItem[]
+  orderItems OrderItem[]
+  movements InventoryMovement[]
+  @@unique([storeId,sku])
+  @@index([storeId,name])
+}
+model Supplier {
+  id String @id @default(cuid())
+  storeId String
+  store Store @relation(fields:[storeId],references:[id],onDelete:Cascade)
+  name String
+  phone String?
+  note String?
+  batches InventoryBatch[]
+}
+model InventoryBatch {
+  id String @id @default(cuid())
+  storeId String
+  productId String
+  supplierId String?
+  supplier Supplier? @relation(fields:[supplierId],references:[id],onDelete:SetNull)
+  quantity Decimal @db.Decimal(14,3)
+  remaining Decimal @db.Decimal(14,3)
+  unitCost Decimal @db.Decimal(14,2)
+  receivedAt DateTime @default(now())
+  expiryAt DateTime?
+  condition String?
+  @@index([storeId,productId,receivedAt])
+}
+model InventoryMovement {
+  id String @id @default(cuid())
+  storeId String
+  productId String
+  product Product @relation(fields:[productId],references:[id],onDelete:Restrict)
+  type MovementType
+  quantity Decimal @db.Decimal(14,3)
+  unitCost Decimal? @db.Decimal(14,2)
+  referenceId String?
+  note String?
+  createdAt DateTime @default(now())
+  @@index([storeId,productId,createdAt])
+}
+model Recipe {
+  id String @id @default(cuid())
+  storeId String
+  name String
+  outputProductId String?
+  active Boolean @default(true)
+  items RecipeItem[]
+}
+model RecipeItem {
+  id String @id @default(cuid())
+  recipeId String
+  recipe Recipe @relation(fields:[recipeId],references:[id],onDelete:Cascade)
+  productId String
+  product Product @relation(fields:[productId],references:[id],onDelete:Restrict)
+  quantity Decimal @db.Decimal(14,3)
+  @@unique([recipeId,productId])
+}
+model Customer {
+  id String @id @default(cuid())
+  storeId String
+  store Store @relation(fields:[storeId],references:[id],onDelete:Cascade)
+  name String
+  phone String?
+  note String?
+  createdAt DateTime @default(now())
+  orders Order[]
+  @@index([storeId,name])
+  @@index([storeId,phone])
+}
+model Order {
+  id String @id @default(cuid())
+  storeId String
+  store Store @relation(fields:[storeId],references:[id],onDelete:Cascade)
+  customerId String?
+  customer Customer? @relation(fields:[customerId],references:[id],onDelete:SetNull)
+  code String
+  status OrderStatus @default(NEW)
+  subtotal Decimal @db.Decimal(14,2)
+  discount Decimal @default(0) @db.Decimal(14,2)
+  deliveryFee Decimal @default(0) @db.Decimal(14,2)
+  total Decimal @db.Decimal(14,2)
+  paidAmount Decimal @default(0) @db.Decimal(14,2)
+  recipientName String?
+  recipientPhone String?
+  deliveryAddress String?
+  deliveryAt DateTime?
+  occasion String?
+  cardMessage String?
+  note String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  items OrderItem[]
+  payments Payment[]
+  refunds Refund[]
+  @@unique([storeId,code])
+  @@index([storeId,status,createdAt])
+  @@index([storeId,deliveryAt])
+}
+model OrderItem {
+  id String @id @default(cuid())
+  orderId String
+  order Order @relation(fields:[orderId],references:[id],onDelete:Cascade)
+  productId String
+  product Product @relation(fields:[productId],references:[id],onDelete:Restrict)
+  productNameSnapshot String
+  unitPrice Decimal @db.Decimal(14,2)
+  quantity Decimal @db.Decimal(14,3)
+  costSnapshot Decimal @db.Decimal(14,2)
+  customization Json?
+}
+model PaymentAccount {
+  id String @id @default(cuid())
+  storeId String
+  store Store @relation(fields:[storeId],references:[id],onDelete:Cascade)
+  bankBin String
+  bankName String
+  accountNumber String
+  accountName String
+  active Boolean @default(true)
+  createdAt DateTime @default(now())
+  requests PaymentRequest[]
+}
+model PaymentRequest {
+  id String @id @default(cuid())
+  storeId String
+  orderId String
+  accountId String
+  account PaymentAccount @relation(fields:[accountId],references:[id],onDelete:Restrict)
+  referenceCode String @unique
+  amount Decimal @db.Decimal(14,2)
+  status PaymentStatus @default(PENDING)
+  providerTransactionId String?
+  expiresAt DateTime?
+  createdAt DateTime @default(now())
+  payments Payment[]
+}
+model Payment {
+  id String @id @default(cuid())
+  orderId String
+  order Order @relation(fields:[orderId],references:[id],onDelete:Cascade)
+  requestId String?
+  request PaymentRequest? @relation(fields:[requestId],references:[id],onDelete:SetNull)
+  method PaymentMethod
+  amount Decimal @db.Decimal(14,2)
+  status PaymentStatus @default(PENDING)
+  transactionRef String?
+  confirmedAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([orderId,status])
+}
+model Refund {
+  id String @id @default(cuid())
+  orderId String
+  order Order @relation(fields:[orderId],references:[id],onDelete:Restrict)
+  amount Decimal @db.Decimal(14,2)
+  reason String
+  status PaymentStatus @default(PENDING)
+  createdAt DateTime @default(now())
+}
+model Expense {
+  id String @id @default(cuid())
+  storeId String
+  store Store @relation(fields:[storeId],references:[id],onDelete:Cascade)
+  category String
+  amount Decimal @db.Decimal(14,2)
+  note String?
+  occurredAt DateTime @default(now())
+  createdAt DateTime @default(now())
+  @@index([storeId,occurredAt])
+}
+model AuditLog {
+  id String @id @default(cuid())
+  storeId String
+  userId String?
+  user User? @relation(fields:[userId],references:[id],onDelete:SetNull)
+  action String
+  entity String
+  entityId String?
+  metadata Json?
+  createdAt DateTime @default(now())
+  @@index([storeId,createdAt])
+}
+
+// Giai doan 1: ban sao POS dung chung, chong ghi de bang revision.
+model SharedPosState {
+  key String @id
+  revision Int @default(0)
+  payload Json
+  updatedAt DateTime @updatedAt
+}

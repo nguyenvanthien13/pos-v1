@@ -1,0 +1,95 @@
+import { Body, Controller, Get, Headers, HttpException, HttpStatus, Post } from '@nestjs/common';
+import { PrismaClient, Prisma } from '@prisma/client';
+import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+
+const prisma = new PrismaClient();
+const KEY = 'nanghoa-main';
+function secret() { const s=process.env.AUTH_SECRET; if(!s || s.length<32) throw new Error('AUTH_SECRET phai dai it nhat 32 ky tu'); return s; }
+function match(input:string, expected:string) { const salt='nanghoa-auth-v1'; const a=scryptSync(input,salt,32); const b=scryptSync(expected,salt,32); return timingSafeEqual(a,b); }
+function sign(data:string) { return createHmac('sha256',secret()).update(data).digest('base64url'); }
+function verify(header?:string) {
+ const token=(header||'').replace(/^Bearer\s+/i,''); const [payload,signature]=token.split('.');
+ if(!payload||!signature||signature.length!==sign(payload).length||!timingSafeEqual(Buffer.from(sign(payload)),Buffer.from(signature))) throw new HttpException('Phien dang nhap khong hop le',401);
+ let parsed:{role:string;exp:number}; try {parsed=JSON.parse(Buffer.from(payload,'base64url').toString());}catch{throw new HttpException('Token khong hop le',401)}
+ if(parsed.exp<Date.now())throw new HttpException('Phien dang nhap het han',401);
+ return parsed.role;
+}
+@Controller('sync')
+export class SyncController {
+ @Post('login') login(@Body() body:{username?:string;password?:string}) {
+  const username=String(body?.username||''); const password=String(body?.password||'');
+  const admin=process.env.ADMIN_USERNAME||'ngockieuadmin'; const user=process.env.USER_USERNAME||'user';
+  const role=username===admin?'admin':username===user?'user':'';
+  const expected=role==='admin'?process.env.ADMIN_PASSWORD:role==='user'?process.env.USER_PASSWORD:undefined;
+  if(!expected||!match(password,expected))throw new HttpException('Sai tai khoan hoac mat khau',401);
+  const payload=Buffer.from(JSON.stringify({role,exp:Date.now()+8*60*60*1000,nonce:randomBytes(8).toString('hex')})).toString('base64url');
+  return {token:payload+'.'+sign(payload),role};
+ }
+
+ // Checkout transaction: serialize concurrent purchases and prevent negative stock.
+ // A repeated request with the same id is idempotent, including after a lost response.
+ @Post('checkout') async checkout(@Headers('authorization') auth:string,@Body() body:{order:any}) {
+  verify(auth);
+  const order=body?.order;
+  if(!order || typeof order.id!=='string' || !/^DH-[a-zA-Z0-9-]{8,80}$/.test(order.id) || !Array.isArray(order.items) || !order.items.length || order.items.length>100)
+    throw new HttpException('Don hang khong hop le',400);
+  if(!Number.isFinite(order.total)||order.total<0||!Number.isFinite(order.paid)||order.paid<0||order.paid>order.total)
+    throw new HttpException('So tien khong hop le',400);
+  return prisma.$transaction(async tx=>{
+   // Transaction-level advisory lock is shared by all checkout requests for this POS.
+   await tx.$executeRaw`SELECT pg_advisory_xact_lock(7531123)`;
+   const state=await tx.sharedPosState.findUnique({where:{key:KEY}});
+   if(!state)throw new HttpException('Chua khoi tao du lieu server. Hay dong bo lan dau.',409);
+   const data=state.payload as any;
+   if(!data || !Array.isArray(data.products)||!Array.isArray(data.orders)||!Array.isArray(data.customers))throw new HttpException('Du lieu server khong hop le',500);
+   const old=data.orders.find((o:any)=>o.id===order.id);
+   if(old)return {revision:state.revision,data,order:old,duplicate:true};
+   const used=new Map<string,number>();
+   for(const item of order.items){
+    if(typeof item?.productId!=='string'||!Number.isSafeInteger(item.qty)||item.qty<=0||item.qty>100000)throw new HttpException('So luong khong hop le',400);
+    used.set(item.productId,(used.get(item.productId)||0)+item.qty);
+   }
+   for(const [id,qty] of used){
+    const product=data.products.find((p:any)=>p.id===id);
+    if(!product||!product.active||!Number.isFinite(product.stock)||product.stock<qty)throw new HttpException('Khong du ton kho: '+id,409);
+   }
+   const items=order.items.map((item:any)=>{
+    const product=data.products.find((p:any)=>p.id===item.productId);
+    return {productId:product.id,name:product.name,price:product.price,cost:product.cost,qty:item.qty};
+   });
+   const subtotal=items.reduce((sum:number,item:any)=>sum+item.price*item.qty,0);
+   const discount=Number(order.discount),deliveryFee=Number(order.deliveryFee);
+   if(!Number.isFinite(discount)||discount<0||!Number.isFinite(deliveryFee)||deliveryFee<0)throw new HttpException('Giam gia hoac phi giao khong hop le',400);
+   const total=Math.max(0,subtotal-discount+deliveryFee);
+   const paid=order.method==='Đặt cọc'?Math.round(total*.5):order.method==='Chuyển khoản QR'?0:total;
+   const paymentStatus=paid>=total?'Đã thanh toán':paid>0?'Đã cọc':'Chưa thanh toán';
+   const savedOrder={...order,items,subtotal,total,paid,status:paymentStatus,paymentStatus,createdAt:new Date().toISOString()};
+   const products=data.products.map((p:any)=>used.has(p.id)?{...p,stock:p.stock-used.get(p.id),updatedAt:new Date().toISOString()}:p);
+   const stockLog=[...items.map((i:any)=>({id:randomBytes(12).toString('hex'),date:new Date().toISOString().slice(0,10),sku:products.find((p:any)=>p.id===i.productId)?.sku||'',name:i.name,change:-i.qty,reason:'Xuất bán',orderId:order.id})),...(Array.isArray(data.stockLog)?data.stockLog:[])];
+   const customers=order.customer!=='Khách lẻ'&&!data.customers.some((c:any)=>c.phone===order.phone)?[...data.customers,{id:'C'+randomBytes(8).toString('hex'),name:order.customer,phone:order.phone,note:''}]:data.customers;
+   const next={...data,products,orders:[savedOrder,...data.orders],customers,stockLog};
+   if(Buffer.byteLength(JSON.stringify(next))>3_000_000)throw new HttpException('Du lieu qua lon',413);
+   // CAS prevents overwriting a snapshot update that raced with this checkout.
+   const changed=await tx.sharedPosState.updateMany({where:{key:KEY,revision:state.revision},data:{revision:{increment:1},payload:next as Prisma.InputJsonValue}});
+   if(!changed.count)throw new HttpException('Du lieu vua thay doi. Thu lai thao tac.',409);
+   return {revision:state.revision+1,data:next,order:savedOrder,duplicate:false};
+  },{timeout:15000});
+ }
+ @Get('state') async get(@Headers('authorization') auth?:string) {
+  verify(auth); const state=await prisma.sharedPosState.findUnique({where:{key:KEY}});
+  return {revision:state?.revision||0,data:state?.payload||null,updatedAt:state?.updatedAt||null};
+ }
+ @Post('state') async save(@Headers('authorization') auth:string,@Body() body:{revision:number;data:unknown}) {
+  verify(auth);
+  if(!Number.isInteger(body?.revision)||body.revision<0||!body?.data||typeof body.data!=='object')throw new HttpException('Du lieu khong hop le',400);
+  const bytes=Buffer.byteLength(JSON.stringify(body.data)); if(bytes>3_000_000)throw new HttpException('Du lieu vuot 3 MB. Hay su dung URL anh thay vi base64.',413);
+  // OCC: updateMany only succeeds for the exact revision; first write is create protected by unique key.
+  if(body.revision===0) {
+   try {const created=await prisma.sharedPosState.create({data:{key:KEY,revision:1,payload:body.data as Prisma.InputJsonValue}});return {revision:created.revision,updatedAt:created.updatedAt};}
+   catch(e){if(typeof e === 'object' && e !== null && 'code' in e && e.code === 'P2002')throw new HttpException('Du lieu da thay doi tren may khac. Hay tai lai.',409);throw e;}
+  }
+  const result=await prisma.sharedPosState.updateMany({where:{key:KEY,revision:body.revision},data:{revision:{increment:1},payload:body.data as Prisma.InputJsonValue}});
+  if(!result.count)throw new HttpException('Du lieu da thay doi tren may khac. Hay tai lai.',409);
+  return prisma.sharedPosState.findUnique({where:{key:KEY},select:{revision:true,updatedAt:true}});
+ }
+}
